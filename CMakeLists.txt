@@ -82,6 +82,9 @@ else()
 
 	pkg_search_module(SDL2 QUIET sdl2)
 	find_package(OpenGL QUIET)
+	pkg_search_module(WAYLAND_CLIENT QUIET wayland-client)
+	pkg_search_module(WAYLAND_EGL QUIET wayland-egl)
+	pkg_search_module(EGL QUIET egl)
 
 	# ---------------------------------------------------------
 	# TARGET 1: cavacore lib
@@ -140,8 +143,29 @@ else()
 		if(OPENGL_FOUND)
 			message(STATUS "Found OpenGL")
 			target_compile_definitions(cava PRIVATE SDL_GLSL)
-			target_sources(cava PRIVATE output/sdl_glsl.c)
 			target_link_libraries(cava PRIVATE OpenGL::GL)
+
+			if(WAYLAND_CLIENT_FOUND AND WAYLAND_EGL_FOUND AND EGL_FOUND)
+				message(STATUS "Found wayland-client/wayland-egl/egl: using layer-shell transparent glsl output")
+				target_sources(cava PRIVATE
+					output/layer_glsl.c
+					output/protocols/wlr-layer-shell-unstable-v1-protocol.c
+					output/protocols/xdg-shell-protocol.c
+				)
+				target_include_directories(cava PRIVATE
+					${WAYLAND_CLIENT_INCLUDE_DIRS}
+					${WAYLAND_EGL_INCLUDE_DIRS}
+					${EGL_INCLUDE_DIRS}
+					${CMAKE_CURRENT_SOURCE_DIR}/output/protocols
+				)
+				target_link_libraries(cava PRIVATE
+					${WAYLAND_CLIENT_LIBRARIES}
+					${WAYLAND_EGL_LIBRARIES}
+					${EGL_LIBRARIES}
+				)
+			else()
+				target_sources(cava PRIVATE output/sdl_glsl.c)
+			endif()
 		endif()
 	endif()
 

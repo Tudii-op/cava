@@ -49,6 +49,9 @@ GLint uniform_previous_bars;
 GLint uniform_bars_count;
 GLint uniform_time;
 GLint uniform_input_texture;
+GLint uniform_peaks;
+GLint uniform_color_phase;
+GLint uniform_beat;
 GLuint fbo;
 GLuint texture;
 struct timespec start_time;
@@ -70,6 +73,89 @@ GLuint custom_shaders(const char *, const char *);
 const char *read_file(const char *);
 GLuint compile_shader(GLenum type, const char **);
 GLuint program_check(GLuint);
+
+// --- Per-frame state the shaders can't keep themselves ---
+// A shader has no memory between frames, so anything that builds up over
+// time is computed here and handed over as a uniform. Each one is only
+// computed when the shader declares it.
+
+// Seconds since the previous frame (0 on the first one, capped at 0.1).
+static float frame_dt(void) {
+    static struct timespec last;
+    static bool started = false;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    float dt = 0.0f;
+    if (started) {
+        dt = (float)(now.tv_sec - last.tv_sec) + (float)(now.tv_nsec - last.tv_nsec) / 1e9f;
+        if (dt > 0.1f)
+            dt = 0.1f;
+    }
+    last = now;
+    started = true;
+    return dt;
+}
+
+// `peaks`: each bar's peak jumps up with the bar, holds for a moment, then
+// falls with gravity.
+#define PEAK_MAX 512
+#define PEAK_HOLD_SECONDS 0.2f
+#define PEAK_GRAVITY 3.2f // in bar heights per second squared
+static float peaks[PEAK_MAX], peak_speed[PEAK_MAX], peak_hold[PEAK_MAX];
+
+static void update_peaks(int count, const float bars[], float dt) {
+    if (count > PEAK_MAX)
+        count = PEAK_MAX;
+    for (int i = 0; i < count; i++) {
+        float b = bars[i] < 0.0f ? 0.0f : (bars[i] > 1.0f ? 1.0f : bars[i]);
+        if (b >= peaks[i]) {
+            peaks[i] = b;
+            peak_speed[i] = 0.0f;
+            peak_hold[i] = PEAK_HOLD_SECONDS;
+        } else if (peak_hold[i] > 0.0f) {
+            peak_hold[i] -= dt;
+        } else {
+            peak_speed[i] += PEAK_GRAVITY * dt;
+            peaks[i] -= peak_speed[i] * dt;
+            if (peaks[i] < b)
+                peaks[i] = b;
+        }
+    }
+}
+
+// `color_phase`: keeps moving forward, faster when the music is louder.
+// Shaders use it to scroll colors and spin the ring, so the motion speeds up
+// with the music. It wraps after 1000 whole turns, so `color_phase * k` stays
+// seamless for any k with up to 3 decimals (accumulated in double precision).
+// `beat`: jumps up when loudness spikes above its recent average (a hit),
+// then decays. Both use overall loudness, so they work for any bar layout.
+#define PHASE_IDLE_SPEED 0.15f  // radians per second, even when quiet
+#define PHASE_LOUD_SPEED 2.5f   // extra radians per second at full loudness
+#define PHASE_WRAP (6.283185307179586 * 1000.0)
+#define LOUDNESS_AVG_SECONDS 0.6f
+#define BEAT_GAIN 4.0f
+#define BEAT_DECAY_SECONDS 0.22f
+static double color_phase = 0.0;
+static float beat = 0.0f, loudness_avg = 0.0f;
+
+static void update_color_motion(int count, const float bars[], float dt) {
+    if (count <= 0)
+        return;
+    float loudness = 0.0f;
+    for (int i = 0; i < count; i++)
+        loudness += bars[i] < 0.0f ? 0.0f : (bars[i] > 1.0f ? 1.0f : bars[i]);
+    loudness /= (float)count;
+
+    color_phase = fmod(color_phase + dt * (PHASE_IDLE_SPEED + PHASE_LOUD_SPEED * loudness),
+                       PHASE_WRAP);
+
+    loudness_avg += (loudness - loudness_avg) * (1.0f - expf(-dt / LOUDNESS_AVG_SECONDS));
+    float hit = (loudness - loudness_avg) * BEAT_GAIN;
+    hit = hit < 0.0f ? 0.0f : (hit > 1.0f ? 1.0f : hit);
+    beat *= expf(-dt / BEAT_DECAY_SECONDS);
+    if (hit > beat)
+        beat = hit;
+}
 
 // --- Wayland registry: bind compositor + layer-shell globals ---
 
@@ -271,6 +357,9 @@ void init_sdl_glsl_window(int width, int height, int x, int y, int full_screen,
     uniform_bars_count = glGetUniformLocation(shading_program, "bars_count");
     uniform_time = glGetUniformLocation(shading_program, "shader_time");
     uniform_input_texture = glGetUniformLocation(shading_program, "inputTexture");
+    uniform_peaks = glGetUniformLocation(shading_program, "peaks");
+    uniform_color_phase = glGetUniformLocation(shading_program, "color_phase");
+    uniform_beat = glGetUniformLocation(shading_program, "beat");
 
     if (uniform_input_texture != -1) {
         glGenFramebuffers(1, &fbo);
@@ -359,6 +448,18 @@ int draw_sdl_glsl(int bars_count, const float bars[], const float previous_bars[
             glUniform1fv(uniform_previous_bars, bars_count, previous_bars);
         if (uniform_bars_count != -1)
             glUniform1i(uniform_bars_count, bars_count);
+        float dt = frame_dt();
+        if (uniform_peaks != -1) {
+            update_peaks(bars_count, bars, dt);
+            glUniform1fv(uniform_peaks, bars_count < PEAK_MAX ? bars_count : PEAK_MAX, peaks);
+        }
+        if (uniform_color_phase != -1 || uniform_beat != -1) {
+            update_color_motion(bars_count, bars, dt);
+            if (uniform_color_phase != -1)
+                glUniform1f(uniform_color_phase, (float)color_phase);
+            if (uniform_beat != -1)
+                glUniform1f(uniform_beat, beat);
+        }
         if (uniform_time != -1) {
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
